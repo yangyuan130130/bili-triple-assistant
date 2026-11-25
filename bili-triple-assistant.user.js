@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站一键三连 · 智能分类收藏
 // @namespace    https://github.com/yangyuan130130
-// @version      1.0.0
-// @description  主动点击后完成点赞、投币、收藏；根据标题和标签判断类型，自动选择或新建私密收藏夹
+// @version      1.1.0
+// @description  主动点击后完成点赞、投币、收藏；按标题与标签关键词模糊匹配收藏夹，未匹配时用出现次数最多的标签新建私密收藏夹
 // @author       yangyuan130130
 // @match        https://www.bilibili.com/video/*
 // @icon         https://www.bilibili.com/favicon.ico
@@ -24,8 +24,12 @@
     debug: false,
     requestTimeout: 20000,
     storageKey: 'bta:settings:v1',
+    uiKey: 'bta:ui:v1',
     defaultCoinCount: 1,
     defaultFallbackFolder: '未分类',
+    folderNameMax: 40,
+    // 模糊匹配的最低可接受分数，低于该分数视为「没有匹配到」。
+    folderMatchMinScore: 300,
   };
 
   // 规则按顺序参与竞争；同分时排在前面的优先。
@@ -76,6 +80,17 @@
     let s = str(v);
     try { s = s.normalize('NFKC'); } catch (e) { /* 老浏览器忽略 */ }
     return s.toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
+  // 比对用的强归一：全半角统一、转小写，并去掉空白与常见分隔符/标点。
+  // 这样「408 考研」「408-考研」「４０８考研」都能折叠成同一个键。
+  // 注意保留「+」：C++、C++++ 这类名字去掉加号会退化成单字，反而匹配不上。
+  const SEP_RE = /[\s\u00a0\u3000·・•\-_—–－~～!！?？.,，。;；:：'"“”‘’`()（）\[\]【】{}<>《》/\\|&*#@$%^=]+/g;
+
+  function squeeze(v) {
+    let s = str(v);
+    try { s = s.normalize('NFKC'); } catch (e) { /* 老浏览器忽略 */ }
+    return s.toLowerCase().replace(SEP_RE, '');
   }
 
   function clock() {
@@ -185,14 +200,137 @@
     };
   }
 
-  /** 只按完整名称匹配（忽略首尾空格、大小写与全半角），不做模糊收藏夹匹配。 */
-  function findFolder(folders, targetName) {
+  /**
+   * 关键词池：标签原样 + 标题切分出的词块。
+   * 用于收藏夹的模糊匹配，长度不足 2 个字符的碎片丢弃，避免「的」「上」这类噪声。
+   */
+  function buildKeywords(video, tags) {
+    const out = [];
+    const seen = new Set();
+    function push(v, maxLen) {
+      const raw = cleanFolderName(v);
+      if (!raw) return;
+      const key = squeeze(raw);
+      if (!key || key.length < 2 || key.length > maxLen) return;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(raw);
+    }
+    (Array.isArray(tags) ? tags : []).forEach((t) => {
+      push(typeof t === 'string' ? t : (t && (t.tag_name || t.name)), 40);
+    });
+    str(video && video.title).split(SEP_RE).forEach((p) => push(p, 24));
+    return out.slice(0, 32);
+  }
+
+  /**
+   * 统计标签出现次数（归一后合并大小写/空白差异），返回出现最多的标签。
+   * 并列时取原始标签列表中最靠前的一个：B 站标签按相关度排序，
+   * 因此同一视频每次运行结果一致，可复现、可预期。
+   */
+  function pickTopTag(tags) {
+    const map = new Map();
+    (Array.isArray(tags) ? tags : []).forEach((t, i) => {
+      const raw = cleanFolderName(typeof t === 'string' ? t : (t && (t.tag_name || t.name)));
+      const key = squeeze(raw);
+      if (!key) return;
+      const hit = map.get(key);
+      if (hit) hit.count += 1;
+      else map.set(key, { name: raw, count: 1, first: i });
+    });
+    let best = null;
+    let tieCount = 0;
+    map.forEach((v) => {
+      if (!best || v.count > best.count) { best = v; tieCount = 1; }
+      else if (v.count === best.count) tieCount += 1;
+    });
+    if (!best) return null;
+    return { name: best.name, count: best.count, first: best.first, tie: tieCount > 1 };
+  }
+
+  /**
+   * 目标收藏夹名：
+   *   1) 有标签 → 出现次数最多的标签；
+   *   2) 没有标签 → 分类规则给出的名字；
+   *   3) 都不行 → 兜底收藏夹。
+   */
+  function suggestFolderName(tags, classification) {
+    const top = pickTopTag(tags);
+    if (top && top.name) {
+      return {
+        name: cleanFolderName(top.name).slice(0, CFG.folderNameMax),
+        from: 'tag',
+        count: top.count,
+        tie: top.tie,
+      };
+    }
+    const c = classification || {};
+    const name = cleanFolderName(c.folder) || CFG.defaultFallbackFolder;
+    return {
+      name: name.slice(0, CFG.folderNameMax),
+      from: c.matched ? 'rule' : 'fallback',
+      count: 0,
+      tie: false,
+    };
+  }
+
+  /**
+   * 关键词模糊匹配收藏夹。分数从高到低：
+   *   名称完全一致（折叠大小写/全半角/空白/标点）     1000
+   *   收藏夹名包含目标名                               800+
+   *   目标名包含收藏夹名                               700+
+   *   关键词与收藏夹名完全一致                         600
+   *   收藏夹名包含关键词（关键词 ≥3 字）               400+
+   *   关键词包含收藏夹名（收藏夹名 ≥3 字）             300+
+   * 低于 CFG.folderMatchMinScore 视为未匹配。
+   * 同分时取收藏夹列表里更靠前的一个（接口按创建顺序返回），结果稳定。
+   */
+  function matchFolder(folders, targetName, keywords) {
     const list = Array.isArray(folders) ? folders : [];
-    const raw = cleanFolderName(targetName);
-    const wanted = norm(raw);
-    return list.find((f) => cleanFolderName(f && f.title) === raw)
-      || list.find((f) => norm(f && f.title) === wanted)
-      || null;
+    const tk = squeeze(targetName);
+    // 名字为空说明调用方没有目标，此时不做任何猜测（避免空串命中所有收藏夹）。
+    if (!tk) return null;
+    const targetLabel = cleanFolderName(targetName);
+    const words = (Array.isArray(keywords) ? keywords : [])
+      .map((k) => ({ raw: cleanFolderName(k), key: squeeze(k) }))
+      .filter((k) => k.key && k.key.length >= 2);
+    let best = null;
+
+    list.forEach((f, order) => {
+      const title = cleanFolderName(f && f.title);
+      const fk = squeeze(title);
+      if (!fk) return;
+      let score = 0;
+      let why = '';
+
+      if (tk && fk === tk) {
+        score = 1000; why = '名称一致';
+      } else if (tk && tk.length >= 2 && fk.includes(tk)) {
+        score = 800 + Math.min(tk.length, 20); why = '名称包含「' + targetLabel + '」';
+      } else if (tk && fk.length >= 2 && tk.includes(fk)) {
+        score = 700 + Math.min(fk.length, 20); why = '名称被「' + targetLabel + '」包含';
+      }
+
+      for (let i = 0; i < words.length; i += 1) {
+        if (score >= 700) break;
+        const w = words[i];
+        let s = 0;
+        let label = '';
+        if (fk === w.key) {
+          s = 600; label = '与「' + w.raw + '」同名';
+        } else if (w.key.length >= 3 && fk.includes(w.key)) {
+          s = 400 + Math.min(w.key.length, 20); label = '名称含「' + w.raw + '」';
+        } else if (fk.length >= 3 && w.key.includes(fk)) {
+          s = 300 + Math.min(fk.length, 20); label = '名称被「' + w.raw + '」包含';
+        }
+        if (s > score) { score = s; why = label; }
+      }
+
+      if (score < CFG.folderMatchMinScore) return;
+      if (!best || score > best.score) best = { folder: f, score: score, why: why, order: order };
+    });
+
+    return best;
   }
 
   function apiMessage(body, fallback) {
@@ -216,10 +354,13 @@
    * 真正执行三连。所有写操作只尝试一次，不做自动重试。
    * io.preflight 必须先返回最新的点赞、投币、收藏夹状态。
    * io.assertActive 用于页面切换后的过期任务保护。
+   * task.allowKeywordMatch 为假时（用户改过输入框）只按名称匹配，
+   * 不再用视频关键词把内容路由到别的收藏夹。
    */
   async function executeTriple(task, io) {
     const video = task.video;
     const targetName = cleanFolderName(task.targetName);
+    const keywordList = task.allowKeywordMatch && Array.isArray(task.keywords) ? task.keywords : [];
     const out = {
       targetName: targetName,
       folder: null,
@@ -231,7 +372,8 @@
     if (!targetName) throw new Error('收藏夹名称不能为空');
 
     const pre = await io.preflight(video);
-    let folder = findFolder(pre.folders, targetName);
+    const hit = matchFolder(pre.folders, targetName, keywordList);
+    let folder = hit ? hit.folder : null;
     out.folder = folder;
     let stop = false;
 
@@ -290,14 +432,14 @@
           out.folderCreated = true;
         } else {
           // 另一个标签页可能同时建好了；只读重查一次，不重复提交创建。
-          if (typeof io.refindFolder === 'function') folder = await io.refindFolder(targetName);
+          if (typeof io.refindFolder === 'function') folder = await io.refindFolder(targetName, keywordList);
           if (!folder) applyFailure(out.favorite, body);
         }
       } catch (e) {
         if (e && e.code === 'STALE') throw e;
         // 网络异常时也可能其实已创建成功，先只读核对。
         try {
-          if (typeof io.refindFolder === 'function') folder = await io.refindFolder(targetName);
+          if (typeof io.refindFolder === 'function') folder = await io.refindFolder(targetName, keywordList);
         } catch (ignore) { /* 保留下面的未知状态 */ }
         if (!folder) out.favorite = unknownResult(e);
       }
@@ -492,6 +634,11 @@
       folders = Array.isArray(data && data.list) ? data.list : [];
     }
 
+    const classification = classify(video, tags, settings.rules, settings.fallbackFolder);
+    const keywords = buildKeywords(video, tags);
+    const pick = suggestFolderName(tags, classification);
+    const hit = matchFolder(folders, pick.name, keywords);
+
     return {
       video: video,
       tags: tags,
@@ -499,7 +646,15 @@
       login: login,
       mid: mid,
       folders: folders,
-      classification: classify(video, tags, settings.rules, settings.fallbackFolder),
+      keywords: keywords,
+      classification: classification,
+      target: {
+        name: hit ? cleanFolderName(hit.folder.title) : pick.name,
+        match: hit,
+        from: pick.from,
+        tagCount: pick.count,
+        tie: pick.tie,
+      },
     };
   }
 
@@ -535,10 +690,11 @@
       };
     }
 
-    async function refindFolder(name) {
+    async function refindFolder(name, keywords) {
       const nav = unwrap(await request('GET', EP.nav), EP.nav);
       const data = unwrap(await request('GET', EP.folders, { up_mid: num(nav.mid), type: 2 }), EP.folders);
-      return findFolder(data && data.list, name);
+      const hit = matchFolder(data && data.list, name, keywords);
+      return hit ? hit.folder : null;
     }
 
     function post(path, form) {
@@ -560,7 +716,7 @@
         return post(EP.coinAdd, Object.assign(videoParams(video), { multiply: count, select_like: 0 }));
       },
       createFolder: (name) => {
-        log('目标收藏夹不存在，提交新建私密收藏夹「' + name + '」');
+        log('未匹配到现有收藏夹，提交新建私密收藏夹「' + name + '」');
         return post(EP.folderAdd, {
           title: name,
           intro: '由 B站一键三连·智能分类收藏 创建',
@@ -581,7 +737,7 @@
   }
 
   // ============================================================
-  // 5. Shadow DOM 面板
+  // 5. 右侧固定停靠面板（Shadow DOM）
   // ============================================================
   const HOST_ID = 'bili-triple-assistant-host';
   const CSS = `
@@ -592,58 +748,86 @@
   all: initial;
 }
 * { box-sizing: border-box; }
+.dock {
+  display: flex; align-items: center; justify-content: flex-end;
+  max-height: calc(100vh - 32px);
+}
+.tab {
+  display: none; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+  width: 30px; height: 116px; padding: 0; border: 0; cursor: pointer;
+  border-radius: 10px 0 0 10px; color: #fff;
+  background: linear-gradient(180deg, var(--accent), var(--accent2));
+  font: 11px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+  letter-spacing: 2px; writing-mode: vertical-rl;
+  box-shadow: -2px 0 14px rgba(0,0,0,.16);
+}
+.tab:hover { filter: brightness(1.05); }
+.dock[data-mode="closed"] .tab { display: flex; }
+.dock[data-mode="closed"] .card { display: none; }
 .card {
-  width: 330px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px;
-  background: var(--bg); color: var(--text); box-shadow: 0 8px 30px rgba(0,0,0,.18);
+  display: flex; flex-direction: column; width: 300px; max-height: calc(100vh - 32px);
+  overflow: hidden; border: 1px solid var(--line); border-right: 0; border-radius: 12px 0 0 12px;
+  background: var(--bg); color: var(--text); box-shadow: 0 8px 28px rgba(0,0,0,.16);
   font: 12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
 }
-.head { display:flex; align-items:center; gap:8px; padding:10px 12px; font-size:13px; font-weight:600; }
-.head .name { flex:1; }
+.head {
+  flex: none; display: flex; align-items: center; gap: 6px; padding: 8px 8px 8px 12px;
+  border-bottom: 1px solid var(--line); font-size: 13px; font-weight: 600;
+}
+.head .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 button, select, input, textarea { font: inherit; color: inherit; }
-button { cursor:pointer; }
-.icon { width:25px; height:25px; border:0; border-radius:6px; background:transparent; color:var(--muted); }
-.icon:hover { background:var(--panel); color:var(--text); }
-.body { padding:0 12px 11px; }
-.video { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); margin-bottom:8px; }
-.status { padding:7px 9px; border-radius:7px; background:var(--panel); margin-bottom:8px; }
-.status.warn { color:var(--warn); }
-.kind { display:flex; align-items:center; gap:6px; margin:7px 0 2px; }
-.badge { padding:2px 7px; border-radius:5px; background:rgba(251,114,153,.12); color:var(--accent2); font-weight:600; }
-.evidence { color:var(--muted); font-size:11px; margin:3px 0 9px; word-break:break-all; }
-.label { display:block; color:var(--muted); margin:7px 0 4px; }
+button { cursor: pointer; }
+.icon {
+  width: 24px; height: 24px; border: 0; border-radius: 6px; background: transparent;
+  color: var(--muted); font-size: 14px; line-height: 1;
+}
+.icon:hover { background: var(--panel); color: var(--text); }
+.body {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  padding: 9px 11px 11px; scrollbar-width: thin;
+}
+.body::-webkit-scrollbar { width: 6px; }
+.body::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+.video { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); margin-bottom: 7px; }
+.status { padding: 6px 8px; border-radius: 7px; background: var(--panel); margin-bottom: 7px; }
+.status.warn { color: var(--warn); }
+.kind { display: flex; align-items: center; gap: 6px; margin: 6px 0 2px; }
+.badge { padding: 2px 7px; border-radius: 5px; background: rgba(251,114,153,.12); color: var(--accent2); font-weight: 600; }
+.evidence { color: var(--muted); font-size: 11px; margin: 3px 0 8px; word-break: break-all; }
+.label { display: block; color: var(--muted); margin: 6px 0 4px; }
 .target {
-  width:100%; height:32px; padding:0 9px; border:1px solid var(--line); border-radius:7px;
-  outline:none; background:var(--bg);
+  width: 100%; height: 31px; padding: 0 9px; border: 1px solid var(--line); border-radius: 7px;
+  outline: none; background: var(--bg);
 }
-.target:focus { border-color:var(--accent); }
-.folderHint { min-height:18px; color:var(--muted); font-size:11px; margin:4px 0 8px; }
-.actions { display:flex; gap:7px; align-items:center; }
+.target:focus { border-color: var(--accent); }
+.folderHint { min-height: 17px; color: var(--muted); font-size: 11px; margin: 4px 0 8px; word-break: break-all; }
+.actions { display: flex; gap: 6px; align-items: center; }
 .primary {
-  flex:1; height:34px; border:0; border-radius:8px; background:var(--accent); color:#fff;
-  font-weight:600; font-size:13px;
+  flex: 1; height: 33px; border: 0; border-radius: 8px; background: var(--accent); color: #fff;
+  font-weight: 600; font-size: 13px;
 }
-.primary:hover { background:var(--accent2); }
-.primary:disabled { cursor:not-allowed; opacity:.45; }
-.secondary { height:32px; padding:0 10px; border:1px solid var(--line); border-radius:7px; background:var(--bg); }
-.results { margin-top:9px; border-top:1px solid var(--line); padding-top:7px; }
-.result { display:flex; gap:7px; padding:3px 0; }
-.result .k { flex:none; width:42px; color:var(--muted); }
-.result .v { flex:1; word-break:break-all; }
-.result.success .v, .result.already .v { color:var(--ok); }
-.result.failed .v, .result.unknown .v { color:var(--bad); }
-.result.skipped .v { color:var(--warn); }
-.summary { margin-top:5px; font-weight:600; }
-.settings { margin-top:10px; padding-top:9px; border-top:1px solid var(--line); }
-.row { display:flex; gap:8px; align-items:center; margin:6px 0; }
-.row > span { flex:none; width:76px; color:var(--muted); }
-.row input, .row select { flex:1; min-width:0; height:29px; border:1px solid var(--line); border-radius:6px; background:var(--bg); padding:0 6px; }
-.rules { width:100%; height:145px; resize:vertical; border:1px solid var(--line); border-radius:7px; background:var(--panel); padding:7px; font:10.5px/1.45 Consolas,monospace; }
-.settingsMsg { min-height:17px; color:var(--warn); margin-top:4px; }
-details { margin-top:8px; color:var(--muted); }
-summary { cursor:pointer; }
-pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-all; background:var(--panel); padding:7px; border-radius:6px; font:10px/1.5 Consolas,monospace; }
-.foot { margin-top:8px; color:var(--muted); font-size:10.5px; }
-.folded .body { display:none; }
+.primary:hover { background: var(--accent2); }
+.primary:disabled { cursor: not-allowed; opacity: .45; }
+.secondary { height: 31px; padding: 0 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); flex: none; }
+.results { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px; }
+.result { display: flex; gap: 6px; padding: 3px 0; }
+.result .k { flex: none; width: 36px; color: var(--muted); }
+.result .v { flex: 1; word-break: break-all; }
+.result.success .v, .result.already .v { color: var(--ok); }
+.result.failed .v, .result.unknown .v { color: var(--bad); }
+.result.skipped .v { color: var(--warn); }
+.summary { margin-top: 5px; font-weight: 600; }
+.settings { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
+.row { display: flex; gap: 7px; align-items: center; margin: 6px 0; }
+.row > span { flex: none; width: 68px; color: var(--muted); }
+.row input, .row select { flex: 1; min-width: 0; height: 28px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); padding: 0 6px; }
+.rules { width: 100%; height: 140px; resize: vertical; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); padding: 7px; font: 10.5px/1.45 Consolas,monospace; }
+.settingsMsg { min-height: 16px; color: var(--warn); margin-top: 4px; }
+details { margin-top: 7px; color: var(--muted); }
+summary { cursor: pointer; }
+pre { max-height: 140px; overflow: auto; white-space: pre-wrap; word-break: break-all; background: var(--panel); padding: 7px; border-radius: 6px; font: 10px/1.5 Consolas,monospace; }
+.foot { margin-top: 7px; color: var(--muted); font-size: 10.5px; }
+@media (max-width: 1360px) { .card { width: 272px; } }
 :host([data-theme="dark"]) {
   --bg:#1f2023; --panel:#2a2c30; --text:#e8eaed; --muted:#a0a5ae; --line:#3c3f45;
   --accent2:#ff8bad; --ok:#55c98a; --warn:#e4ac55; --bad:#ff8095;
@@ -651,50 +835,57 @@ pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-al
 `;
 
   const HTML = `
-<div class="card">
-  <div class="head">
-    <span class="name">一键三连 · 智能收藏</span>
-    <button class="icon" data-act="fold" title="折叠">−</button>
-  </div>
-  <div class="body">
-    <div class="video">正在读取视频…</div>
-    <div class="status">正在读取登录态与标签…</div>
-    <div class="kind"><span>判断类型</span><span class="badge">···</span></div>
-    <div class="evidence"></div>
-    <label class="label" for="target">收藏到（执行前可修改）</label>
-    <input id="target" class="target" list="folderList" maxlength="40" autocomplete="off" />
-    <datalist id="folderList"></datalist>
-    <div class="folderHint"></div>
-    <div class="actions">
-      <button class="primary" data-act="run" disabled>一键三连</button>
-      <button class="secondary" data-act="refresh" title="重新读取">刷新</button>
-      <button class="secondary" data-act="settings">设置</button>
+<div class="dock" data-mode="open">
+  <button class="tab" data-act="toggle" title="展开一键三连面板">一键三连</button>
+  <div class="card">
+    <div class="head">
+      <span class="name">一键三连 · 智能收藏</span>
+      <button class="icon" data-act="fold" title="收起到右侧边缘">»</button>
     </div>
-    <div class="results" hidden></div>
-    <section class="settings" hidden>
-      <div class="row"><span>投币数量</span><select class="coin"><option value="1">1 枚</option><option value="2">2 枚</option></select></div>
-      <div class="row"><span>未识别时</span><input class="fallback" maxlength="40" /></div>
-      <label class="label">分类规则 JSON（保存后立即重新判断）</label>
-      <textarea class="rules" spellcheck="false"></textarea>
-      <div class="actions"><button class="secondary" data-act="saveSettings">保存设置</button><button class="secondary" data-act="resetRules">恢复默认规则</button></div>
-      <div class="settingsMsg"></div>
-    </section>
-    <details><summary>诊断日志</summary><pre></pre></details>
-    <div class="foot">只在点击按钮后执行 · 新收藏夹默认私密 · 不自动重试写操作</div>
+    <div class="body">
+      <div class="video">正在读取视频…</div>
+      <div class="status">正在读取登录态与标签…</div>
+      <div class="kind"><span>判断类型</span><span class="badge">···</span></div>
+      <div class="evidence"></div>
+      <label class="label" for="target">收藏到（执行前可修改）</label>
+      <input id="target" class="target" list="folderList" maxlength="40" autocomplete="off" />
+      <datalist id="folderList"></datalist>
+      <div class="folderHint"></div>
+      <div class="actions">
+        <button class="primary" data-act="run" disabled>一键三连</button>
+        <button class="secondary" data-act="refresh" title="重新读取">刷新</button>
+        <button class="secondary" data-act="settings">设置</button>
+      </div>
+      <div class="results" hidden></div>
+      <section class="settings" hidden>
+        <div class="row"><span>投币数量</span><select class="coin"><option value="1">1 枚</option><option value="2">2 枚</option></select></div>
+        <div class="row"><span>未识别时</span><input class="fallback" maxlength="40" /></div>
+        <label class="label">分类规则 JSON（保存后立即重新判断）</label>
+        <textarea class="rules" spellcheck="false"></textarea>
+        <div class="actions"><button class="secondary" data-act="saveSettings">保存设置</button><button class="secondary" data-act="resetRules">恢复默认规则</button></div>
+        <div class="settingsMsg"></div>
+      </section>
+      <details><summary>诊断日志</summary><pre></pre></details>
+      <div class="foot">只在点击按钮后执行 · 新收藏夹默认私密 · 不自动重试写操作</div>
+    </div>
   </div>
 </div>`;
+
+  function loadUiMode() {
+    try { return localStorage.getItem(CFG.uiKey) === 'closed' ? 'closed' : 'open'; } catch (e) { return 'open'; }
+  }
 
   const UI = (() => {
     let host = null;
     let shadow = null;
-    let card = null;
     const r = {};
 
     function mount() {
       if (host && host.isConnected) return;
       host = document.createElement('div');
       host.id = HOST_ID;
-      host.style.cssText = 'position:fixed;right:18px;bottom:110px;z-index:2147483000;';
+      // 固定贴右边缘、垂直居中：只占边缘一条，不压住视频主体。
+      host.style.cssText = 'position:fixed;right:0;top:50%;transform:translateY(-50%);z-index:2147483000;';
       shadow = host.attachShadow({ mode: 'open' });
       const style = document.createElement('style');
       style.textContent = CSS;
@@ -703,8 +894,7 @@ pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-al
       wrap.innerHTML = HTML;
       shadow.appendChild(wrap);
       document.documentElement.appendChild(host);
-      card = shadow.querySelector('.card');
-      ['video', 'status', 'badge', 'evidence', 'target', 'folderList', 'folderHint', 'results', 'settings', 'coin', 'fallback', 'rules', 'settingsMsg'].forEach((k) => {
+      ['dock', 'video', 'status', 'badge', 'evidence', 'target', 'folderList', 'folderHint', 'results', 'settings', 'coin', 'fallback', 'rules', 'settingsMsg'].forEach((k) => {
         r[k] = shadow.querySelector('.' + k) || shadow.querySelector('#' + k);
       });
       r.run = shadow.querySelector('[data-act="run"]');
@@ -712,14 +902,16 @@ pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-al
       r.coin.value = String(settings.coinCount);
       r.fallback.value = settings.fallbackFolder;
       r.rules.value = JSON.stringify(settings.rules, null, 2);
+      setMode(loadUiMode());
 
       shadow.addEventListener('click', (e) => {
         const b = e.target.closest('[data-act]');
         if (!b) return;
         const act = b.dataset.act;
         if (act === 'fold') {
-          card.classList.toggle('folded');
-          b.textContent = card.classList.contains('folded') ? '+' : '−';
+          setMode('closed');
+        } else if (act === 'toggle') {
+          setMode('open');
         } else if (act === 'refresh') {
           sync(true);
         } else if (act === 'settings') {
@@ -742,6 +934,12 @@ pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-al
         saveSettings();
       });
       applyTheme();
+    }
+
+    function setMode(mode) {
+      const m = mode === 'closed' ? 'closed' : 'open';
+      if (r.dock) r.dock.dataset.mode = m;
+      try { localStorage.setItem(CFG.uiKey, m); } catch (e) { /* 隐私模式忽略 */ }
     }
 
     function applyTheme() {
@@ -771,11 +969,11 @@ pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-al
       r.badge.textContent = c.matched ? c.type + ' · ' + c.score + ' 分' : '未可靠识别';
       const ev = [];
       if (c.evidence.length) ev.push('依据：' + c.evidence.slice(0, 3).join('、'));
-      else ev.push('没有规则达到阈值，将使用未识别收藏夹');
+      else ev.push('没有规则达到阈值，类型未定');
       if (preview.tagError) ev.push('标签读取失败，本次未使用标签');
       else ev.push('标签：' + (preview.tags.length ? preview.tags.slice(0, 6).join(' / ') : '无'));
       r.evidence.textContent = ev.join('；');
-      if (!targetDirty) r.target.value = c.folder;
+      if (!targetDirty) r.target.value = (preview.target && preview.target.name) || c.folder;
       r.folderList.textContent = '';
       preview.folders.forEach((f) => {
         const op = document.createElement('option');
@@ -802,10 +1000,17 @@ pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-al
         r.run.disabled = true;
         return;
       }
-      const found = findFolder(ctx.folders, name);
-      r.folderHint.textContent = found
-        ? '将使用现有收藏夹 · 当前 ' + num(found.media_count) + ' 个内容'
-        : '不存在同名收藏夹，将自动新建为「私密」';
+      // 用户手动改过名称时只按名称匹配，避免被视频关键词带去别的收藏夹。
+      const hit = matchFolder(ctx.folders, name, targetDirty ? null : ctx.keywords);
+      if (hit) {
+        r.folderHint.textContent = '匹配现有收藏夹「' + cleanFolderName(hit.folder.title) + '」· '
+          + hit.why + ' · 当前 ' + num(hit.folder.media_count) + ' 个内容';
+      } else if (!targetDirty && ctx.target && ctx.target.from === 'tag') {
+        r.folderHint.textContent = '未匹配到现有收藏夹，将新建私密收藏夹「' + name + '」'
+          + '（取自出现次数最多的标签' + (ctx.target.tie ? '，并列取最靠前的' : '') + '）';
+      } else {
+        r.folderHint.textContent = '未匹配到现有收藏夹，将新建私密收藏夹「' + name + '」';
+      }
       r.run.disabled = !ctx.login || running;
     }
 
@@ -843,7 +1048,7 @@ pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-al
       r.results.appendChild(frag);
       r.run.textContent = '重新检查并三连';
       r.run.disabled = !ctx || !ctx.login;
-      if (out.folder && !findFolder(ctx.folders, out.targetName)) ctx.folders.push(out.folder);
+      if (out.folder && !matchFolder(ctx.folders, out.folder.title, null)) ctx.folders.push(out.folder);
       updateFolderHint();
     }
 
@@ -852,7 +1057,7 @@ pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-al
       r.run.disabled = !ctx || !ctx.login;
     }
 
-    return { mount, show, hide, loading, render, error, updateFolderHint, busy, renderResult, readyAfterError, applyTheme, refs: r };
+    return { mount, show, hide, loading, render, error, updateFolderHint, busy, renderResult, readyAfterError, applyTheme, setMode, refs: r };
   })();
 
   // ============================================================
@@ -889,7 +1094,9 @@ pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-al
       if (my !== seq) return;
       ctx = preview;
       UI.render(preview);
-      log('分类：' + preview.classification.type + ' → ' + preview.classification.folder + '；登录=' + preview.login);
+      log('分类：' + preview.classification.type + ' → ' + preview.target.name
+        + (preview.target.match ? '（匹配现有：' + preview.target.match.why + '）' : '（将新建）')
+        + '；登录=' + preview.login);
     } catch (e) {
       if (my !== seq) return;
       log('预览失败：' + ((e && e.message) || e));
@@ -907,11 +1114,14 @@ pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-al
     running = true;
     const my = seq;
     const currentCtx = ctx;
+    const allowKeywordMatch = !targetDirty;
     UI.busy();
     try {
       const out = await executeTriple({
         video: currentCtx.video,
         targetName: targetName,
+        keywords: currentCtx.keywords,
+        allowKeywordMatch: allowKeywordMatch,
         coinCount: settings.coinCount,
       }, makeIO(my));
       if (my !== seq) return;
@@ -940,6 +1150,17 @@ pre { max-height:145px; overflow:auto; white-space:pre-wrap; word-break:break-al
       UI.refs.settingsMsg.textContent = '设置已保存';
       if (ctx) {
         ctx.classification = classify(ctx.video, ctx.tags, settings.rules, settings.fallbackFolder);
+        if (!ctx.target || ctx.target.from !== 'tag') {
+          const pick = suggestFolderName(ctx.tags, ctx.classification);
+          const hit = matchFolder(ctx.folders, pick.name, ctx.keywords);
+          ctx.target = {
+            name: hit ? cleanFolderName(hit.folder.title) : pick.name,
+            match: hit,
+            from: pick.from,
+            tagCount: pick.count,
+            tie: pick.tie,
+          };
+        }
         targetDirty = false;
         UI.render(ctx);
       }
