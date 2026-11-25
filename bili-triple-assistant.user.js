@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站一键三连 · 智能分类收藏
 // @namespace    https://github.com/yangyuan130130
-// @version      1.1.0
+// @version      1.1.1
 // @description  主动点击后完成点赞、投币、收藏；按标题与标签关键词模糊匹配收藏夹，未匹配时用出现次数最多的标签新建私密收藏夹
 // @author       yangyuan130130
 // @match        https://www.bilibili.com/video/*
@@ -886,8 +886,7 @@ pre { max-height: 140px; overflow: auto; white-space: pre-wrap; word-break: brea
       host.id = HOST_ID;
       // 固定贴右边缘、垂直居中：只占边缘一条，不压住视频主体。
       host.style.cssText = 'position:fixed;right:0;top:50%;transform:translateY(-50%);z-index:2147483000;';
-      shadow = host.attachShadow({ mode: 'open' });
-      const style = document.createElement('style');
+      shadow = host.attachShadow({ mode: 'open' });      const style = document.createElement('style');
       style.textContent = CSS;
       shadow.appendChild(style);
       const wrap = document.createElement('div');
@@ -934,6 +933,15 @@ pre { max-height: 140px; overflow: auto; white-space: pre-wrap; word-break: brea
         saveSettings();
       });
       applyTheme();
+      syncEdge();
+      window.addEventListener('resize', syncEdge);
+    }
+
+    // 让面板贴在滚动条内侧：直接 right:0 会被原生滚动条压住一条边。
+    function syncEdge() {
+      if (!host) return;
+      const gap = Math.max(0, Math.round((window.innerWidth || 0) - (document.documentElement.clientWidth || 0)));
+      host.style.right = gap + 'px';
     }
 
     function setMode(mode) {
@@ -948,6 +956,7 @@ pre { max-height: 140px; overflow: auto; white-space: pre-wrap; word-break: brea
         || (document.body && document.body.classList.contains('dark'))
         || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
       host.dataset.theme = dark ? 'dark' : 'light';
+      syncEdge();
     }
 
     function show() { if (host) host.style.display = ''; }
